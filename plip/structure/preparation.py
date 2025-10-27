@@ -513,9 +513,20 @@ class Mol:
         """Select all carbon atoms which have only carbons and/or hydrogens as direct neighbors."""
         atom_set = []
         data = namedtuple('hydrophobic', 'atom orig_atom orig_idx')
-        atm = [a for a in all_atoms if a.atomicnum == 6 and set([natom.GetAtomicNum() for natom
-                                                                 in pybel.ob.OBAtomAtomIter(a.OBAtom)]).issubset(
-            {1, 6})]
+        atm = []
+        for a in all_atoms:
+            if a.atomicnum == 6:
+                neighbour_atom_elements = set([natom.GetAtomicNum() for natom in pybel.ob.OBAtomAtomIter(a.OBAtom)])
+                if 16 in neighbour_atom_elements: #special case for S
+                    # Need to check whether S is bonded to other S or C
+                    s = [natom for natom in pybel.ob.OBAtomAtomIter(a.OBAtom) if natom.GetAtomicNum() == 16][0]
+                    s_neighbour_elements = set([natom.GetAtomicNum() for natom in pybel.ob.OBAtomAtomIter(s)])
+                    if s_neighbour_elements.issubset({6, 16}):
+                        atm.append(a)
+                else:
+                    if neighbour_atom_elements.issubset({1,6}):
+                        atm.append(a)
+
         for atom in atm:
             orig_idx = self.Mapper.mapid(atom.idx, mtype=self.mtype, bsid=self.bsid)
             orig_atom = self.Mapper.id_to_atom(orig_idx)
@@ -1479,7 +1490,8 @@ class Ligand(Mol):
             res = hy_ob.GetResidue()
             res_id = f"{res.GetName().strip()}_{res.GetIdx()}"
             aname = res.GetAtomID(hy_ob).strip()
-            peptide_res_atom_charachteristics[res_id]['hydrophobic'].add(aname)
+            if aname != 'CA': # For cases of beta-AA in which CA is considered hydrophobic
+                peptide_res_atom_charachteristics[res_id]['hydrophobic'].add(aname)
 
         for ring in self.rings:
             ring_ob = ring.atoms[0].OBAtom
@@ -1523,9 +1535,14 @@ class Ligand(Mol):
                         peptide_res_charachteristics[res]['polar'] = True
                     else:
                         peptide_res_charachteristics[res]['polar'] = False
+                else:
+                    # i.e. only hydrophobic atoms - no hbad or charged - decide by size
+                    if len(atom_props['hydrophobic']) > 2:
+                        peptide_res_charachteristics[res]['polar'] = False
+                    else:
+                        peptide_res_charachteristics[res]['polar'] = True
             elif atom_props['charged']['sidechain'] or atom_props['hb_ad']['sidechain']:
                 peptide_res_charachteristics[res]['polar'] = True
-        
         self.peptide_res_characteristics = peptide_res_charachteristics
         self.peptide_res_atom_characteristics = peptide_res_atom_charachteristics
 
