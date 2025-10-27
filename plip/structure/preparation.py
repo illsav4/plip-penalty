@@ -1920,12 +1920,12 @@ class PLPenalties:
                     lig_saltbridge_members_idxs.add(int(oid))
                 for oid in getattr(sb.positive, "atoms_orig_idx", []) or []:
                     lig_saltbridge_members_idxs.add(int(oid))
-                lig_saltbridge_groups_members.add(sb.negative)
-                lig_saltbridge_groups_members.add(sb.positive)
+                lig_saltbridge_groups_members.add(frozenset(sb.negative.atoms_orig_idx))
+                lig_saltbridge_groups_members.add(frozenset(sb.positive.atoms_orig_idx))
             else:
                 for oid in getattr(sb.negative, "atoms_orig_idx", []) or []:
                     lig_saltbridge_members_idxs.add(int(oid))
-                lig_saltbridge_groups_members.add(sb.negative)
+                lig_saltbridge_groups_members.add(frozenset(sb.negative.atoms_orig_idx))
 
         for sb in pli.saltbridge_pneg:
             if intra:
@@ -1933,12 +1933,12 @@ class PLPenalties:
                     lig_saltbridge_members_idxs.add(int(oid))
                 for oid in getattr(sb.positive, "atoms_orig_idx", []) or []:
                     lig_saltbridge_members_idxs.add(int(oid))
-                lig_saltbridge_groups_members.add(sb.negative)
-                lig_saltbridge_groups_members.add(sb.positive)
+                lig_saltbridge_groups_members.add(frozenset(sb.negative.atoms_orig_idx))
+                lig_saltbridge_groups_members.add(frozenset(sb.positive.atoms_orig_idx))
             else:
                 for oid in getattr(sb.positive, "atoms_orig_idx", []) or []:
                     lig_saltbridge_members_idxs.add(int(oid))
-                lig_saltbridge_groups_members.add(sb.positive)
+                lig_saltbridge_groups_members.add(frozenset(sb.positive.atoms_orig_idx))
                 
         return lig_saltbridge_members_idxs, lig_saltbridge_groups_members
     
@@ -1967,12 +1967,12 @@ class PLPenalties:
                     lig_pistacking_members_idxs.add(int(oid))
                 for oid in getattr(ps.ligandring, "atoms_orig_idx", []) or []:
                     lig_pistacking_members_idxs.add(int(oid))
-                lig_pistacking_groups_members.add(ps.proteinring)
-                lig_pistacking_groups_members.add(ps.ligandring)
+                lig_pistacking_groups_members.add(frozenset(ps.proteinring.atoms_orig_idx))
+                lig_pistacking_groups_members.add(frozenset(ps.ligandring.atoms_orig_idx))
             else:
                 for oid in getattr(ps.ligandring, "atoms_orig_idx", []) or []:
                     lig_pistacking_members_idxs.add(int(oid))
-                lig_pistacking_groups_members.add(ps.ligandring)
+                lig_pistacking_groups_members.add(frozenset(ps.ligandring.atoms_orig_idx))
 
         return lig_pistacking_members_idxs, lig_pistacking_groups_members
     
@@ -1988,20 +1988,20 @@ class PLPenalties:
             if intra:
                 for oid in getattr(pc.ring, "atoms_orig_idx", []) or []:
                     lig_pication_ring_members_idxs.add(int(oid))
-                lig_pication_ring_groups_members.add(pc.ring)
+                lig_pication_ring_groups_members.add(frozenset(pc.ring.atoms_orig_idx))
 
                 for oid in getattr(pc.charge, "atoms_orig_idx", []) or []:
                     lig_pication_charge_members_idxs.add(int(oid))
-                lig_pication_charge_groups_members.add(pc.charge)
+                lig_pication_charge_groups_members.add(frozenset(pc.charge.atoms_orig_idx))
             else:
                 if pc.protcharged:
                     for oid in getattr(pc.ring, "atoms_orig_idx", []) or []:
                         lig_pication_ring_members_idxs.add(int(oid))
-                    lig_pication_ring_groups_members.add(pc.ring)
+                    lig_pication_ring_groups_members.add(frozenset(pc.ring.atoms_orig_idx))
                 else:
                     for oid in getattr(pc.charge, "atoms_orig_idx", []) or []:
                         lig_pication_charge_members_idxs.add(int(oid))
-                    lig_pication_charge_groups_members.add(pc.charge)
+                    lig_pication_charge_groups_members.add(frozenset(pc.charge.atoms_orig_idx))
             
         return lig_pication_ring_members_idxs, lig_pication_charge_members_idxs, lig_pication_ring_groups_members, lig_pication_charge_groups_members
     
