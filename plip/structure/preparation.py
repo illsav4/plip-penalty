@@ -7,8 +7,13 @@ from operator import itemgetter
 
 import numpy as np
 from openbabel import pybel
+from openbabel import openbabel as ob
+from pathlib import Path
+import rust_sasa_python as sasa
+import biotite.structure.io as bts_io
 
-from plip.basic import config, logger
+
+from plip.basic import logger, config
 from plip.basic.supplemental import centroid, tilde_expansion, tmpfile, classify_by_name
 from plip.basic.supplemental import cluster_doubles, is_lig, normalize_vector, vector, ring_is_planar
 from plip.basic.supplemental import extract_pdbid, read_pdb, create_folder_if_not_exists, canonicalize
@@ -336,6 +341,9 @@ class LigandFinder:
         logger.debug(f'hetero atoms determined (n={len(hetatoms)})')
 
         # create a new ligand molecule representing any k-mer linked structures
+        # Added this line to propagarte aromaticity to ligand
+        pybel.ob.OBAromaticTyper().AssignAromaticFlags(self.proteincomplex.OBMol)
+
         lig = pybel.ob.OBMol()
         # create bit vector with 1 for all ligand atoms and 0 for all others
         atomsBitVec = pybel.ob.OBBitVec(self.proteincomplex.OBMol.NumAtoms())
@@ -350,6 +358,7 @@ class LigandFinder:
 
         newidx = dict(zip(sorted(hetatoms.keys()), [obatom.GetIdx() for obatom in pybel.ob.OBMolAtomIter(lig)]))
         mapold = dict(zip(newidx.values(), newidx))
+
 
         lig = pybel.Molecule(lig)
 
@@ -608,6 +617,8 @@ class PLInteraction:
     """Class to store a ligand, a protein and their interactions."""
 
     def __init__(self, lig_obj, bs_obj, protcomplex):
+        from plip.structure.detection import halogen, pication, water_bridges, metal_complexation
+        from plip.structure.detection import hydrophobic_interactions, pistacking, hbonds, saltbridge
         """Detect all interactions when initializing"""
         self.ligand = lig_obj
         self.lig_members = lig_obj.members
@@ -621,10 +632,18 @@ class PLInteraction:
         self.saltbridge_lneg = saltbridge(self.bindingsite.get_pos_charged(), self.ligand.get_neg_charged(), True)
         self.saltbridge_pneg = saltbridge(self.ligand.get_pos_charged(), self.bindingsite.get_neg_charged(), False)
 
-        self.all_hbonds_ldon = hbonds(self.bindingsite.get_hba(),
+        # Note: In intra mode the hbonds are dublicated because filter_contacts(inside hbonds) works for 
+        # pdon and ldon individually, but does not check them together. This is ok for INTER
+        if config.INTRA:
+             self.all_hbonds_ldon = hbonds(self.ligand.get_hba(),
                                       self.ligand.get_hbd(), False, 'strong')
-        self.all_hbonds_pdon = hbonds(self.ligand.get_hba(),
-                                      self.bindingsite.get_hbd(), True, 'strong')
+             self.all_hbonds_pdon = hbonds(self.ligand.get_hba(),
+                                      self.ligand.get_hbd(), True, 'strong')
+        else:
+            self.all_hbonds_ldon = hbonds(self.bindingsite.get_hba(),
+                                        self.ligand.get_hbd(), False, 'strong')
+            self.all_hbonds_pdon = hbonds(self.ligand.get_hba(),
+                                        self.bindingsite.get_hbd(), True, 'strong')
 
         self.hbonds_ldon = self.refine_hbonds_ldon(self.all_hbonds_ldon, self.saltbridge_lneg,
                                                    self.saltbridge_pneg)
@@ -667,6 +686,11 @@ class PLInteraction:
                                       for atom in self.unpaired_hal]
         self.num_unpaired_hba, self.num_unpaired_hbd = len(self.unpaired_hba), len(self.unpaired_hbd)
         self.num_unpaired_hal = len(self.unpaired_hal)
+        
+        # --- Penalties (optional) ---
+        '''if self.calc_penalties:
+            self._compute_penalties()'''
+
 
         # Exclude empty chains (coming from ligand as a target, from metal complexes)
         self.interacting_chains = sorted(list(set([i.reschain for i in self.all_itypes
@@ -924,6 +948,7 @@ class PLInteraction:
         return filtered_wb
 
 
+
 class BindingSite(Mol):
     def __init__(self, atoms, protcomplex, cclass, altconf, min_dist, mapper):
         """Find all relevant parts which could take part in interactions"""
@@ -966,7 +991,7 @@ class BindingSite(Mol):
                     continue
             a_contributing = []
             a_contributing_orig_idx = []
-            if res.GetName() in ('ARG', 'HIS', 'LYS'):  # Arginine, Histidine or Lysine have charged sidechains
+            if res.GetName() in ('ARG', 'HIS', 'HIP', 'LYS'):  # Arginine, Histidine or Lysine have charged sidechains
                 for a in pybel.ob.OBResidueAtomIter(res):
                     if a.GetType().startswith('N') and res.GetAtomProperty(a, 8) \
                             and not self.Mapper.mapid(a.GetIdx(), mtype='protein') in self.altconf:
@@ -1201,10 +1226,24 @@ class Ligand(Mol):
         """
         data = namedtuple('lcharge', 'atoms orig_atoms atoms_orig_idx type center fgroup')
         a_set = []
-        if not (config.INTRA or config.PEPTIDES or config.CHAINS):
+
+        # Needed to detect charged histidine and modified version of it
+        imidazol_ring_candidates = [[a for a in all_atoms if ring.IsMember(a.OBAtom)] for ring in self.molecule.OBMol.GetSSSR() if ring.Size() == 5]
+        imidazol_ring_candidates = [alist for alist in imidazol_ring_candidates if [a.OBAtom.GetAtomicNum() for a in alist].count(7) == 2]
+
+        if not ((config.INTRA or config.PEPTIDES or config.CHAINS) and not config.DETECT_CHARGED_GROUPS_PEPTIDE):
             for a in all_atoms:
                 a_orig_idx = self.Mapper.mapid(a.idx, mtype=self.mtype, bsid=self.bsid)
                 a_orig = self.Mapper.id_to_atom(a_orig_idx)
+                
+                # Histidine detection
+                if imidazol_ring_candidates:
+                    if any([a in alist for alist in imidazol_ring_candidates]):
+                        if a.OBAtom.GetFormalCharge() == 1:
+                            a_set.append(data(atoms=[a, ], orig_atoms=[a_orig, ], atoms_orig_idx=[a_orig_idx, ], type='positive',
+                                      center=list(a.coords), fgroup='imidazole'))
+                            continue
+
                 if self.is_functional_group(a, 'quartamine'):
                     a_set.append(data(atoms=[a, ], orig_atoms=[a_orig, ], atoms_orig_idx=[a_orig_idx, ], type='positive',
                                       center=list(a.coords), fgroup='quartamine'))
@@ -1270,7 +1309,7 @@ class Ligand(Mol):
                         data(atoms=a_contributing, orig_atoms=orig_contributing, atoms_orig_idx=a_contributing_orig_idx,
                              type='positive',
                              center=a.coords, fgroup='guanidine'))
-        else:
+        '''if (config.INTRA or config.PEPTIDES or config.CHAINS):
             """We have peptide/protein chain as ligand"""
             """Looks for positive charges in arginine, histidine or lysine, for negative in aspartic and glutamic acid."""
             for res in pybel.ob.OBResidueIter(self.molecule.OBMol):
@@ -1279,14 +1318,14 @@ class Ligand(Mol):
                         continue
                 a_contributing = []
                 a_contributing_orig_idx = []
-                if res.GetName() in ('ARG', 'HIS', 'LYS'):  # Arginine, Histidine or Lysine have charged sidechains
+                if res.GetName() in ('ARG', 'HIP', 'LYS'):  # Arginine, Histidine(HIP form) or Lysine have charged sidechains
                     for a in pybel.ob.OBResidueAtomIter(res):
                         if a.GetType().startswith('N') and res.GetAtomProperty(a, 8) \
                                 and not self.Mapper.mapid(a.GetIdx(), mtype=self.mtype, bsid=self.bsid) in self.altconf:
                             a_contributing.append(pybel.Atom(a))
                             a_contributing_orig_idx.append(self.Mapper.mapid(a.GetIdx(), mtype=self.mtype, bsid=self.bsid))
                     if not len(a_contributing) == 0:
-                        a_set.append(data(atoms=a_contributing,
+                        a_set_peptide.append(data(atoms=a_contributing,
                                           orig_atoms=[self.Mapper.id_to_atom(idx) for idx in a_contributing_orig_idx],
                                           atoms_orig_idx=a_contributing_orig_idx,
                                           type='positive',
@@ -1299,12 +1338,25 @@ class Ligand(Mol):
                             a_contributing.append(pybel.Atom(a))
                             a_contributing_orig_idx.append(self.Mapper.mapid(a.GetIdx(), mtype=self.mtype, bsid=self.bsid))
                     if not len(a_contributing) == 0:
-                        a_set.append(data(atoms=a_contributing,
+                        a_set_peptide.append(data(atoms=a_contributing,
                                           orig_atoms=[self.Mapper.id_to_atom(idx) for idx in a_contributing_orig_idx],
                                           atoms_orig_idx=a_contributing_orig_idx,
                                           type='negative',
                                           center=centroid([ac.coords for ac in a_contributing]),
                                           fgroup=res.GetName()+str(res.GetNum())+res.GetChain()))
+        
+        # need to check for duplicates
+        if len(a_set) > 0 and len(a_set_peptide) > 0:
+            ligand_data_duplicates = []
+            for inter_data in a_set_peptide:
+                inter_idx_set = set(inter_data.atoms_orig_idx)
+                for lig_inter_data in a_set:
+                    if len(inter_idx_set.intersection(lig_inter_data.atoms_orig_idx)) > 0:
+                        ligand_data_duplicates.append(lig_inter_data)
+            
+            a_set = [i for i in a_set if i not in ligand_data_duplicates]
+
+        a_set = a_set + a_set_peptide'''
         return a_set
 
     def find_metal_binding(self, lig_atoms, water_oxygens):
@@ -1376,6 +1428,108 @@ class Ligand(Mol):
                                       location='ligand', orig_atom=self.Mapper.id_to_atom(a_orig_idx)))
 
         return a_set
+    
+    def characterize_peptide_residues(self):
+
+        peptide_res_atom_charachteristics = {f"{r.GetName().strip()}_{r.GetIdx()}":{'hb_ad':{"bb":set(), 'sidechain':set()},
+                                                                                    'charged':{"bb":set(), 'sidechain':set()},
+                                                                                    'hydrophobic':set(), 'rings':set()} 
+                                             for r in pybel.ob.OBResidueIter(self.molecule.OBMol)}
+
+        for hbda in set([a.a for a in self.get_hba()] + [a.d for a in self.get_hbd()]):
+            hbda_ob = hbda.OBAtom
+            res = hbda_ob.GetResidue()
+            res_id = f"{res.GetName().strip()}_{res.GetIdx()}"
+            aname = res.GetAtomID(hbda_ob).strip()
+            if aname in ['N', 'C', 'CA', 'O', 'OXT', 'CA2', 'CJ']:
+                peptide_res_atom_charachteristics[res_id]['hb_ad']['bb'].add(aname)
+            else:
+                peptide_res_atom_charachteristics[res_id]['hb_ad']['sidechain'].add(aname)
+
+        for charged in self.get_pos_charged() + self.get_neg_charged():
+            ca_ob = charged.atoms[0].OBAtom
+            res = ca_ob.GetResidue()
+            res_id = f"{res.GetName().strip()}_{res.GetIdx()}"
+            ca_anames = tuple([res.GetAtomID(a.OBAtom).strip() for a in charged.atoms])
+            if any(aname in ['N', 'C', 'CA', 'O', 'OXT', 'CA2', 'CJ'] for aname in ca_anames):
+                peptide_res_atom_charachteristics[res_id]['charged']['bb'].add(ca_anames)
+            else:
+                peptide_res_atom_charachteristics[res_id]['charged']['sidechain'].add(ca_anames)
+
+        # Refine hbad to remove duplicates with charged
+        for res_id in peptide_res_atom_charachteristics:
+            charged_bb = peptide_res_atom_charachteristics[res_id]['charged']['bb']
+            charged_sc = peptide_res_atom_charachteristics[res_id]['charged']['sidechain']
+            hbad_bb = peptide_res_atom_charachteristics[res_id]['hb_ad']['bb']
+            hbad_sc = peptide_res_atom_charachteristics[res_id]['hb_ad']['sidechain']
+
+            for charged_, hbad_ in itertools.product([charged_bb, charged_sc], [hbad_bb, hbad_sc]):
+                toremove = set()
+                for hbad in hbad_:
+                    for charged in charged_:
+                        if hbad in charged:
+                            toremove.add(hbad)
+                hbad_.difference_update(toremove)
+            
+            peptide_res_atom_charachteristics[res_id]['hb_ad']['bb'] = hbad_bb
+            peptide_res_atom_charachteristics[res_id]['hb_ad']['sidechain'] = hbad_sc
+
+        for hydrophobic in self.get_hydrophobic_atoms():
+            hy_ob = hydrophobic.atom.OBAtom
+            res = hy_ob.GetResidue()
+            res_id = f"{res.GetName().strip()}_{res.GetIdx()}"
+            aname = res.GetAtomID(hy_ob).strip()
+            peptide_res_atom_charachteristics[res_id]['hydrophobic'].add(aname)
+
+        for ring in self.rings:
+            ring_ob = ring.atoms[0].OBAtom
+            res = ring_ob.GetResidue()
+            res_id = f"{res.GetName().strip()}_{res.GetIdx()}"
+            ca_anames = tuple([res.GetAtomID(a.OBAtom).strip() for a in ring.atoms])
+            peptide_res_atom_charachteristics[res_id]['rings'].add(ca_anames)
+
+        # Refine hydrophobic to remove duplicates with rings
+        for res_id in peptide_res_atom_charachteristics:
+            hydrophobic_res = peptide_res_atom_charachteristics[res_id]['hydrophobic']
+            rings_res = peptide_res_atom_charachteristics[res_id]['rings']
+            toremove = set()
+            for hydrophobic_atom in hydrophobic_res:
+                for ring_system in rings_res:
+                    if hydrophobic_atom in ring_system:
+                        toremove.add(hydrophobic_atom)
+            
+            hydrophobic_res.difference_update(toremove)
+            peptide_res_atom_charachteristics[res_id]['hydrophobic'] = hydrophobic_res
+
+        peptide_res_charachteristics = {k:{'polar':False, 'aromatic':False, 'charged':False} for k in peptide_res_atom_charachteristics.keys()}
+        for res, atom_props in peptide_res_atom_charachteristics.items():
+            if atom_props['charged']['bb'] or atom_props['charged']['sidechain']:
+                peptide_res_charachteristics[res]['charged'] = True
+            
+            if atom_props['rings']:
+                peptide_res_charachteristics[res]['aromatic'] = True
+
+            # Polarity determination
+            if atom_props['rings']:
+                if atom_props['charged']['sidechain'] or atom_props['hb_ad']['sidechain']:
+                    peptide_res_charachteristics[res]['polar'] = True
+                else:
+                    peptide_res_charachteristics[res]['polar'] = False
+            elif atom_props['hydrophobic']:
+                if atom_props['charged']['sidechain'] and len(atom_props['hydrophobic']) <= 4:
+                    peptide_res_charachteristics[res]['polar'] = True
+                elif atom_props['hb_ad']['sidechain']:
+                    if len(atom_props['hb_ad']['sidechain']) / len(atom_props['hydrophobic']) >= 0.333:
+                        peptide_res_charachteristics[res]['polar'] = True
+                    else:
+                        peptide_res_charachteristics[res]['polar'] = False
+            elif atom_props['charged']['sidechain'] or atom_props['hb_ad']['sidechain']:
+                peptide_res_charachteristics[res]['polar'] = True
+        
+        self.peptide_res_characteristics = peptide_res_charachteristics
+        self.peptide_res_atom_characteristics = peptide_res_atom_charachteristics
+
+        return peptide_res_charachteristics, peptide_res_atom_charachteristics
 
 
 class PDBComplex:
@@ -1504,12 +1658,115 @@ class PDBComplex:
         else:
             logger.info(f'structure contains no ligands')
 
-    def analyze(self):
+    def analyze(self, calc_penalties=False, burried_fraction=0.4):
         """Triggers analysis of all complexes in structure"""
+
+        calc_penalties = config.PENALTIES or calc_penalties if hasattr(config, 'PENALTIES') else calc_penalties
+        burried_fraction = config.BURRIED_FRAC if hasattr(config, 'BURRIED_FRAC') else burried_fraction
+
         for ligand in self.ligands:
+
+            if calc_penalties:
+                burried_ligand_atoms_ids, solvent_exposed_ligand_atoms_ids = self.get_ligand_burried_atoms(ligand=ligand,
+                                                                                                            burry_frac=burried_fraction)
+
             self.characterize_complex(ligand)
 
-    def characterize_complex(self, ligand):
+            # TO DO: insert penalty here
+
+    def analyze_peptide(self, calc_penalties=False, burried_fraction=0.4):
+
+        self.penalties = {}
+
+        if not (config.CHAINS or config.PEPTIDES):
+            raise RuntimeError('Either config.CHAINS or config.PEPTIDES should be set for analyze_peptide')
+        
+        calc_penalties = config.PENALTIES or calc_penalties if hasattr(config, 'PENALTIES') else calc_penalties
+        burried_fraction = config.BURRIED_FRAC if hasattr(config, 'BURRIED_FRAC') else burried_fraction
+
+        for ligand in self.ligands:
+
+            if calc_penalties:
+
+                burried_ligand_atoms_ids, solvent_exposed_ligand_atoms_ids = self.get_ligand_burried_atoms(ligand=ligand,
+                                                                                                            burry_frac=burried_fraction)
+
+                # 1. Prot-Peptide inters
+                title_inter = f"{ligand.mol.title}_inter"
+                # print(config.PEPTIDES, config.CHAINS, config.INTRA)
+                self.characterize_complex(ligand, title_inter)
+                config.INTRA = ligand.chain
+                chains = config.CHAINS
+                config.CHAINS = None
+                data = namedtuple('ligand', 'mol hetid chain position water members longname type atomorder can_to_pdb')
+                ligand_intra = data(mol=ligand.mol, hetid=ligand.hetid, chain=ligand.chain, position=ligand.position, water=ligand.water,
+                                    members=ligand.members, longname=ligand.longname, type='INTRA', atomorder=ligand.atomorder,
+                                    can_to_pdb=ligand.can_to_pdb)
+                title_intra = f"{ligand.mol.title}_intra"
+                # print(config.PEPTIDES, config.CHAINS, config.INTRA)
+                self.characterize_complex(ligand_intra, title_intra)
+                config.INTRA = None
+                config.CHAINS = chains
+                penalty = PLPenalties(burried_ligand_atoms_ids, solvent_exposed_ligand_atoms_ids,
+                                      self.interaction_sets[title_inter], self.interaction_sets[title_intra],
+                                      mode='peptide')
+                penalty.compute_penalties_peptide()
+                self.penalties[ligand.mol.title] = penalty
+
+
+
+            else:
+                self.characterize_complex(ligand)
+
+
+        
+    
+    def get_ligand_burried_atoms(self, ligand, burry_frac=0.4):
+        lig_heavy_att_hydrogens = {}
+        for lig_heavy_atom_id in self.Mapper.ligandmaps[ligand.mol.title].values():
+            lig_heavy_atom = self.protcomplex.OBMol.GetAtom(lig_heavy_atom_id)
+            lig_heavy_att_hydrogens[lig_heavy_atom_id] = [nbr.GetIdx() for nbr in ob.OBAtomAtomIter(lig_heavy_atom) if nbr.GetAtomicNum() == 1]
+        all_ligand_atom_ids = sorted(list(lig_heavy_att_hydrogens.keys()) + sum(lig_heavy_att_hydrogens.values(), []))
+        all_ligand_atom_indexes = np.array(all_ligand_atom_ids) - 1
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "tmp.pdb"
+            self.protcomplex.write('pdb', str(p), overwrite=False)
+            compl_bt = bts_io.load_structure(str(p))
+            pept_bt = compl_bt[all_ligand_atom_indexes]
+
+            compl_calculator = sasa.SASACalculator(str(p)).with_n_points(960).with_probe_radius(1.7)
+            compl_sasa = np.array(compl_calculator.calculate_atom())
+            bts_io.save_structure(str(p), pept_bt)
+            pept_calculator = sasa.SASACalculator(str(p)).with_n_points(960).with_probe_radius(1.7)
+            pept_sasa = np.array(pept_calculator.calculate_atom())
+        
+        pept_sasa_dict = {i:v for i,v in zip(all_ligand_atom_ids, pept_sasa)}
+        pept_in_compl_sasa_dict = {i:v for i,v in zip(all_ligand_atom_ids, compl_sasa[all_ligand_atom_indexes])}
+
+        pept_heavy_plus_hydrogens_sasa_dict = {}
+        pept_heavy_plus_hydrogens_compl_sasa_dict = {}
+
+        for k, v in lig_heavy_att_hydrogens.items():
+            pept_heavy_plus_hydrogens_sasa_dict[k] = sum([pept_sasa_dict[hid] for hid in v] + [pept_sasa_dict[k]])
+            pept_heavy_plus_hydrogens_compl_sasa_dict[k] = sum([pept_in_compl_sasa_dict[hid] for hid in v] + [pept_in_compl_sasa_dict[k]])
+
+
+        pept_heavy_plus_hydrogens_sasa_dict = dict(sorted(pept_heavy_plus_hydrogens_sasa_dict.items()))
+        pept_heavy_plus_hydrogens_compl_sasa_dict = dict(sorted(pept_heavy_plus_hydrogens_compl_sasa_dict.items()))
+        pept_heavy_ids = np.array(list(pept_heavy_plus_hydrogens_sasa_dict.keys()))
+        pept_heavy_plus_hydrogens_sasa = np.array(list(pept_heavy_plus_hydrogens_sasa_dict.values()))
+        pept_heavy_plus_hydrogens_compl_sasa = np.array(list(pept_heavy_plus_hydrogens_compl_sasa_dict.values()))
+
+        binding_sasa_diff = pept_heavy_plus_hydrogens_sasa - pept_heavy_plus_hydrogens_compl_sasa
+        binding_sasa_diff_frac = binding_sasa_diff / (pept_heavy_plus_hydrogens_sasa + 1e-10)
+
+        burried_ligand_atoms_ids = pept_heavy_ids[(binding_sasa_diff_frac >= burry_frac) | (pept_heavy_plus_hydrogens_compl_sasa <= 6)]
+        solvent_exposed_ligand_atoms_ids = pept_heavy_ids[~((binding_sasa_diff_frac >= burry_frac) | (pept_heavy_plus_hydrogens_compl_sasa <= 6))]
+
+        return burried_ligand_atoms_ids, solvent_exposed_ligand_atoms_ids
+
+    def characterize_complex(self, ligand, inter_title=None):
         """Handles all basic functions for characterizing the interactions for one ligand"""
 
         single_sites = []
@@ -1519,6 +1776,7 @@ class PDBComplex:
         site = site if not len(site) > 20 else site[:20] + '...'
         longname = ligand.longname if not len(ligand.longname) > 20 else ligand.longname[:20] + '...'
         ligtype = 'unspecified type' if ligand.type == 'UNSPECIFIED' else ligand.type
+
         ligtext = f'{longname} [{ligtype}] -- {site}'
         logger.info(f'processing ligand {ligtext}')
         if ligtype == 'PEPTIDE':
@@ -1533,6 +1791,7 @@ class PDBComplex:
         lig_obj = Ligand(self, ligand)
         cutoff = lig_obj.max_dist_to_center + config.BS_DIST
         bs_res = self.extract_bs(cutoff, lig_obj.centroid, self.resis)
+
         # Get a list of all atoms belonging to the binding site, search by idx
         bs_atoms = [self.atoms[idx] for idx in [i for i in self.atoms.keys()
                                                 if self.atoms[i].OBAtom.GetResidue().GetIdx() in bs_res]
@@ -1563,7 +1822,10 @@ class PDBComplex:
 
         bs_obj = BindingSite(bs_atoms_refined, self.protcomplex, self, self.altconf, min_dist, self.Mapper)
         pli_obj = PLInteraction(lig_obj, bs_obj, self)
-        self.interaction_sets[ligand.mol.title] = pli_obj
+        if inter_title is not None:
+            self.interaction_sets[inter_title] = pli_obj
+        else:
+            self.interaction_sets[ligand.mol.title] = pli_obj
 
     def extract_bs(self, cutoff, ligcentroid, resis):
         """Return list of ids from residues belonging to the binding site"""
@@ -1590,3 +1852,324 @@ class PDBComplex:
     @output_path.setter
     def output_path(self, path):
         self._output_path = tilde_expansion(path)
+
+
+class PLPenalties:
+    def __init__(self, burried_ligand_atoms_ids, solvent_exposed_ligand_atoms_ids,
+                 pli_inter, pli_intra=None, mode='peptide'):
+        self.burried_ligand_atoms_ids = set(burried_ligand_atoms_ids)
+        self.solvent_exposed_ligand_atoms_ids = set(solvent_exposed_ligand_atoms_ids)
+        self.pli_inter = pli_inter
+        self.pli_intra = pli_intra
+        self.mode = mode
+
+    def get_hbond_members(self, pli, intra=False):
+        lig_hbond_members_idxs = set()
+        for hb in (pli.all_hbonds_ldon + pli.all_hbonds_pdon):#(pli.hbonds_ldon + pli.hbonds_pdon):
+            if intra:
+                lig_hbond_members_idxs.add(hb.d_orig_idx)
+                lig_hbond_members_idxs.add(hb.a_orig_idx)
+            else:
+                if hb.protisdon:
+                    # protein is donor ⇒ ligand is acceptor ⇒ take acceptor orig id
+                    lig_hbond_members_idxs.add(int(hb.a_orig_idx))
+                else:
+                    # ligand is donor ⇒ take donor orig id
+                    lig_hbond_members_idxs.add(int(hb.d_orig_idx))
+        return lig_hbond_members_idxs
+    
+    def get_hydrophobic_members(self, pli, intra=False):
+        lig_hydrophobic_members_idxs = set()
+        for h in pli.all_hydrophobic_contacts:#hydrophobic_contacts:
+            if intra:
+                lig_hydrophobic_members_idxs.add(int(h.ligatom_orig_idx))
+                lig_hydrophobic_members_idxs.add(int(h.bsatom_orig_idx))
+            else:
+                lig_hydrophobic_members_idxs.add(int(h.ligatom_orig_idx))
+        return lig_hydrophobic_members_idxs
+    
+    def get_halogenbond_members(self, pli):
+        lig_halogenbond_members_idxs = set()
+        for hx in pli.halogen_bonds:
+            lig_halogenbond_members_idxs.add(int(hx.don_orig_idx))
+        return lig_halogenbond_members_idxs
+    
+    def get_saltbridge_members(self, pli, intra=False):
+        lig_saltbridge_members_idxs = set()
+        lig_saltbridge_groups_members = set()
+        for sb in pli.saltbridge_lneg:
+            if intra:
+                for oid in getattr(sb.negative, "atoms_orig_idx", []) or []:
+                    lig_saltbridge_members_idxs.add(int(oid))
+                for oid in getattr(sb.positive, "atoms_orig_idx", []) or []:
+                    lig_saltbridge_members_idxs.add(int(oid))
+                lig_saltbridge_groups_members.add(sb.negative)
+                lig_saltbridge_groups_members.add(sb.positive)
+            else:
+                for oid in getattr(sb.negative, "atoms_orig_idx", []) or []:
+                    lig_saltbridge_members_idxs.add(int(oid))
+                lig_saltbridge_groups_members.add(sb.negative)
+
+        for sb in pli.saltbridge_pneg:
+            if intra:
+                for oid in getattr(sb.negative, "atoms_orig_idx", []) or []:
+                    lig_saltbridge_members_idxs.add(int(oid))
+                for oid in getattr(sb.positive, "atoms_orig_idx", []) or []:
+                    lig_saltbridge_members_idxs.add(int(oid))
+                lig_saltbridge_groups_members.add(sb.negative)
+                lig_saltbridge_groups_members.add(sb.positive)
+            else:
+                for oid in getattr(sb.positive, "atoms_orig_idx", []) or []:
+                    lig_saltbridge_members_idxs.add(int(oid))
+                lig_saltbridge_groups_members.add(sb.positive)
+                
+        return lig_saltbridge_members_idxs, lig_saltbridge_groups_members
+    
+    def get_waterbridge_members(self, pli, intra=False):
+        lig_waterbridge_members_idxs = set()
+        for wb in pli.water_bridges:
+            if intra:
+                lig_waterbridge_members_idxs.add(int(wb.d_orig_idx))
+                lig_waterbridge_members_idxs.add(int(wb.a_orig_idx))
+            else:
+                if wb.protisdon:
+                    # protein is donor ⇒ ligand is acceptor ⇒ add a_orig_idx
+                    lig_waterbridge_members_idxs.add(int(wb.a_orig_idx))
+                else:
+                    # ligand is donor ⇒ add d_orig_idx
+                    lig_waterbridge_members_idxs.add(int(wb.d_orig_idx))
+        return lig_waterbridge_members_idxs
+    
+    def get_pistacking_members(self, pli, intra=False):
+        lig_pistacking_members_idxs = set()
+        lig_pistacking_groups_members = set()
+
+        for ps in pli.pistacking:
+            if intra:
+                for oid in getattr(ps.proteinring, "atoms_orig_idx", []) or []:
+                    lig_pistacking_members_idxs.add(int(oid))
+                for oid in getattr(ps.ligandring, "atoms_orig_idx", []) or []:
+                    lig_pistacking_members_idxs.add(int(oid))
+                lig_pistacking_groups_members.add(ps.proteinring)
+                lig_pistacking_groups_members.add(ps.ligandring)
+            else:
+                for oid in getattr(ps.ligandring, "atoms_orig_idx", []) or []:
+                    lig_pistacking_members_idxs.add(int(oid))
+                lig_pistacking_groups_members.add(ps.ligandring)
+
+        return lig_pistacking_members_idxs, lig_pistacking_groups_members
+    
+    def get_pication_members(self, pli, intra=False):
+        lig_pication_ring_members_idxs = set()
+        lig_pication_charge_members_idxs = set()
+
+        lig_pication_ring_groups_members = set()
+        lig_pication_charge_groups_members = set()
+
+
+        for pc in (pli.all_pication_laro + pli.all_pication_paro):
+            if intra:
+                for oid in getattr(pc.ring, "atoms_orig_idx", []) or []:
+                    lig_pication_ring_members_idxs.add(int(oid))
+                lig_pication_ring_groups_members.add(pc.ring)
+
+                for oid in getattr(pc.charge, "atoms_orig_idx", []) or []:
+                    lig_pication_charge_members_idxs.add(int(oid))
+                lig_pication_charge_groups_members.add(pc.charge)
+            else:
+                if pc.protcharged:
+                    for oid in getattr(pc.ring, "atoms_orig_idx", []) or []:
+                        lig_pication_ring_members_idxs.add(int(oid))
+                    lig_pication_ring_groups_members.add(pc.ring)
+                else:
+                    for oid in getattr(pc.charge, "atoms_orig_idx", []) or []:
+                        lig_pication_charge_members_idxs.add(int(oid))
+                    lig_pication_charge_groups_members.add(pc.charge)
+            
+        return lig_pication_ring_members_idxs, lig_pication_charge_members_idxs, lig_pication_ring_groups_members, lig_pication_charge_groups_members
+    
+    def map_lig_orig_idx_to_obatom(self, pli, idx):
+        return pli.ligand.atmdict[pli.ligand.inverse_mapping[idx]].OBAtom
+    
+    def map_lig_obatom_to_res_title(self, obatom):
+        res = obatom.GetResidue()
+        res_title = f"{res.GetName().strip()}_{res.GetIdx()}"
+        return res_title
+    
+    def map_lig_orig_idx_to_res_title(self, pli, idx):
+        obatom = self.map_lig_orig_idx_to_obatom(pli, idx)
+        return self.map_lig_obatom_to_res_title(obatom)
+    
+    def compute_penalties_peptide(self):
+        """Compute penalties for peptide ligands in INTER and INTRA modes."""
+        if self.mode != 'peptide':
+            raise ValueError("compute_penalties_peptide is only applicable in 'peptide' mode.")
+        
+        if not (self.pli_inter and self.pli_intra):
+            raise ValueError("compute_penalties_peptide requitres both inter and intra pli in 'peptide' mode.")
+        
+        # Collect hbond members
+        inter_hbond_members_idxs = self.get_hbond_members(self.pli_inter, intra=False)
+        inter_hbond_res_members = {self.map_lig_orig_idx_to_res_title(self.pli_inter, idx) for idx in inter_hbond_members_idxs}
+        intra_hbond_members_idxs = self.get_hbond_members(self.pli_intra, intra=True)
+        # Collect hydrophobic members
+        inter_hydrophobic_members_idxs = self.get_hydrophobic_members(self.pli_inter, intra=False)
+        intra_hydrophobic_members_idxs = self.get_hydrophobic_members(self.pli_intra, intra=True)
+        # Collect halogenbond members
+        inter_halogenbond_members_idxs = self.get_halogenbond_members(self.pli_inter)
+        intra_halogenbond_members_idxs = self.get_halogenbond_members(self.pli_intra)
+        # Collect saltbridge members
+        inter_saltbridge_members_idxs, inter_saltbridge_groups_members = self.get_saltbridge_members(self.pli_inter, intra=False)
+        inter_saltbridge_res_members = {self.map_lig_orig_idx_to_res_title(self.pli_inter, idx) for idx in inter_saltbridge_members_idxs}
+        intra_saltbridge_members_idxs, intra_saltbridge_groups_members = self.get_saltbridge_members(self.pli_intra, intra=True)
+        # Collect waterbridge members
+        inter_waterbridge_members_idxs = self.get_waterbridge_members(self.pli_inter, intra=False)
+        intra_waterbridge_members_idxs = self.get_waterbridge_members(self.pli_intra, intra=True)
+        # Collect pistacking members
+        inter_pistacking_members_idxs, inter_pistacking_groups_members = self.get_pistacking_members(self.pli_inter, intra=False)
+        intra_pistacking_members_idxs, intra_pistacking_groups_members = self.get_pistacking_members(self.pli_intra, intra=True)
+        # Collect pication members
+        inter_pication_ring_members_idxs, inter_pication_charge_members_idxs, inter_pication_ring_groups_members, inter_pication_charge_groups_members = \
+            self.get_pication_members(self.pli_inter, intra=False)
+        intra_pication_ring_members_idxs, intra_pication_charge_members_idxs, intra_pication_ring_groups_members, intra_pication_charge_groups_members = \
+            self.get_pication_members(self.pli_intra, intra=True)
+        
+        paired_non_hydrophobic_inters = inter_hbond_members_idxs | intra_hbond_members_idxs | inter_saltbridge_members_idxs \
+            | intra_saltbridge_members_idxs | inter_waterbridge_members_idxs | intra_waterbridge_members_idxs \
+            | inter_pistacking_members_idxs | intra_pistacking_members_idxs | inter_pication_ring_members_idxs \
+            | inter_pication_charge_members_idxs | intra_pication_ring_members_idxs | intra_pication_charge_members_idxs
+        
+        all_interactions =  paired_non_hydrophobic_inters | inter_halogenbond_members_idxs \
+            | intra_halogenbond_members_idxs | inter_hydrophobic_members_idxs | intra_hydrophobic_members_idxs
+
+
+        # 1. Burried unpaired HBD / HBA
+        
+        raw_unpaired_hbda_idxs = set(self.pli_inter.unpaired_hbd_orig_idx + 
+                                     self.pli_inter.unpaired_hba_orig_idx +
+                                     self.pli_intra.unpaired_hbd_orig_idx +
+                                     self.pli_intra.unpaired_hba_orig_idx)
+        
+        unpaired_hbda_idxs = raw_unpaired_hbda_idxs - all_interactions
+        self.burried_unpaired_hbda_idxs = unpaired_hbda_idxs & self.burried_ligand_atoms_ids
+
+        # 2. Solvent exposed unpaired halogen donors
+
+        paired_halogen_idxs = inter_halogenbond_members_idxs.union(intra_halogenbond_members_idxs)
+        raw_unpaired_halogen_idxs = set(self.pli_inter.unpaired_hal_orig_idx +
+                                        self.pli_intra.unpaired_hal_orig_idx)
+        unpaired_halogen_idxs = raw_unpaired_halogen_idxs - paired_halogen_idxs
+        self.solvent_exposed_unpaired_halogen_idxs = unpaired_halogen_idxs & self.solvent_exposed_ligand_atoms_ids
+
+        # 3. Hydrophobic atoms which are in solvent and do not form any interactions
+        paired_hydrophobic_idxs = inter_hydrophobic_members_idxs | intra_hydrophobic_members_idxs | inter_pistacking_members_idxs \
+                                | intra_pistacking_members_idxs | inter_pication_ring_members_idxs | intra_pication_ring_members_idxs
+
+        raw_hydrophobic_idxs = set([a.orig_idx for a in self.pli_inter.ligand.get_hydrophobic_atoms()])
+        # We want to remove the atoms which are parts of aromatic rings, as it is separate penalty
+        raw_ring_idxs = set(sum([ring.atoms_orig_idx for ring in self.pli_inter.ligand.rings], []))
+        raw_hydrophobic_idxs_refined = raw_hydrophobic_idxs - raw_ring_idxs
+
+        unpaired_hydrophobic_idxs = raw_hydrophobic_idxs_refined - paired_hydrophobic_idxs
+        solvent_exposed_hydrophobic_noi_idxs = unpaired_hydrophobic_idxs & self.solvent_exposed_ligand_atoms_ids
+
+        # Now we want to refine the selection - we check whether any of these atoms are part of residues which form
+        # hbonds or saltbridges in the INTER interactions, or if they're part of polar AAs
+        solvent_exposed_hydrophobic_noi_idxs_refined = set()
+        peptide_res_characteristics, peptide_res_atom_characteristics = self.pli_inter.ligand.characterize_peptide_residues()
+
+        for solv_exp_hdph_aidx in solvent_exposed_hydrophobic_noi_idxs:
+            res_title = self.map_lig_orig_idx_to_res_title(self.pli_inter, solv_exp_hdph_aidx)
+            if res_title in inter_hbond_res_members or res_title in inter_saltbridge_res_members:
+                # This hydrophobic atom is part of a residue which forms hbonds or saltbridges in INTER interactions
+                continue
+            res_characteristics = peptide_res_characteristics.get(res_title, {})
+            res_is_polar = res_characteristics.get('polar', False)
+            if res_is_polar:
+                # This hydrophobic atom is part of a residue which is polar
+                continue
+            solvent_exposed_hydrophobic_noi_idxs_refined.add(solv_exp_hdph_aidx)
+        
+        self.solvent_exposed_unpaired_hydrophobic_idxs = solvent_exposed_hydrophobic_noi_idxs_refined
+
+        # 4. Aromatic rings which are in solvent and does not form any interactions
+        self.solvent_exposed_unpaired_rings = set()
+        for ring in self.pli_inter.ligand.rings:
+            res_title = self.map_lig_orig_idx_to_res_title(self.pli_inter, ring.atoms_orig_idx[0])
+            ringsize = len(ring.atoms)
+            burried_ring_atoms = len(set(ring.atoms_orig_idx) & self.burried_ligand_atoms_ids)
+            ring_is_burried = (burried_ring_atoms / ringsize) >= 0.5
+            if not ring_is_burried:
+                # ring is solvent accessible, check for interactions or polarity
+                if len(set(ring.atoms_orig_idx) & paired_non_hydrophobic_inters) > 0:
+                    continue
+                
+                hydrophobic_only_idxs = inter_hydrophobic_members_idxs | intra_hydrophobic_members_idxs
+                if len(set(ring.atoms_orig_idx) & hydrophobic_only_idxs) > 1:
+                    continue
+
+                self.solvent_exposed_unpaired_rings.add(frozenset(ring.atoms_orig_idx))
+            
+        # 5 / 6. Charged atoms penalties
+        self.burried_unpaired_charged = set()
+        self.solvent_exposed_unpaired_charged = set()
+
+        for charged in self.pli_inter.ligand.get_pos_charged() + self.pli_inter.ligand.get_neg_charged():
+            is_burried = len(set(charged.atoms_orig_idx) & self.burried_ligand_atoms_ids) / len(set(charged.atoms_orig_idx)) > 0.6
+            charged_interactions = inter_saltbridge_members_idxs | intra_saltbridge_members_idxs \
+                                | inter_pication_charge_members_idxs | intra_pication_charge_members_idxs
+            interacts = len(set(charged.atoms_orig_idx) & charged_interactions) > 0
+            if not interacts:
+                if is_burried:
+                    self.burried_unpaired_charged.add(frozenset(charged.atoms_orig_idx))
+                    # refine step 1 here as well
+                    self.burried_unpaired_hbda_idxs = self.burried_unpaired_hbda_idxs - set(charged.atoms_orig_idx)
+                else:
+                    self.solvent_exposed_unpaired_charged.add(frozenset(charged.atoms_orig_idx))
+
+        
+        # 7. Burried hydrophobic atoms which are near (<3.5 A) protein polar atoms
+        self.burried_hydrophobic_unpaired_near_prot_polar_atoms = set()
+        burried_hydrophobic_unpaired_atoms_coords = [(a.atom.coords, a.orig_idx) for a in self.pli_inter.ligand.get_hydrophobic_atoms() 
+                                              if a.orig_idx in self.burried_ligand_atoms_ids and
+                                              a.orig_idx not in all_interactions]
+        bindingsite_polar_charged_atoms_coords = [tuple(ch.center) for ch in self.pli_inter.bindingsite.get_pos_charged() 
+                                                  + self.pli_inter.bindingsite.get_neg_charged()] \
+                                                  + [hba.a.coords for hba in self.pli_inter.bindingsite.get_hba()] \
+                                                  + [hbd.d.coords for hbd in self.pli_inter.bindingsite.get_hbd()]
+        
+        for lig_a_coord, lig_a_idx in burried_hydrophobic_unpaired_atoms_coords:
+            for bs_a_coord in bindingsite_polar_charged_atoms_coords:
+                e = euclidean3d(lig_a_coord, bs_a_coord)
+                if e < 3.5:
+                    self.burried_hydrophobic_unpaired_near_prot_polar_atoms.add(lig_a_idx)
+                    break
+
+        # 8. Split 1 into BB and Sidechain
+        self.burried_unpaired_hbda_bb_idxs = set()
+        self.burried_unpaired_hbda_sc_idxs = set()
+
+        for burr_unp_hbda in self.burried_unpaired_hbda_idxs:
+            oba = self.map_lig_orig_idx_to_obatom(self.pli_inter, burr_unp_hbda)
+            obr = oba.GetResidue()
+            aname = obr.GetAtomID(oba).strip()
+            if aname in ['N', 'C', 'CA', 'O', 'OXT', 'CA2', 'CJ']:
+                self.burried_unpaired_hbda_bb_idxs.add(burr_unp_hbda)
+            else:
+                self.burried_unpaired_hbda_sc_idxs.add(burr_unp_hbda)
+        
+        # Now we compute res versions of penalties
+        atoms_idx_to_res_fn = lambda x: {self.map_lig_orig_idx_to_res_title(self.pli_inter, idx) if isinstance(idx, int) 
+                                         else self.map_lig_orig_idx_to_res_title(self.pli_inter, next(iter(idx))) for idx in x}
+
+        self.burried_unpaired_hbda_reses = atoms_idx_to_res_fn(self.burried_unpaired_hbda_idxs)
+        self.burried_unpaired_hbda_bb_reses = atoms_idx_to_res_fn(self.burried_unpaired_hbda_bb_idxs)
+        self.burried_unpaired_hbda_sc_reses = atoms_idx_to_res_fn(self.burried_unpaired_hbda_sc_idxs)
+
+        self.solvent_exposed_unpaired_halogen_reses = atoms_idx_to_res_fn(self.solvent_exposed_unpaired_halogen_idxs)
+        self.solvent_exposed_unpaired_hydrophobic_reses = atoms_idx_to_res_fn(self.solvent_exposed_unpaired_hydrophobic_idxs)
+        self.solvent_exposed_unpaired_rings_reses = atoms_idx_to_res_fn(self.solvent_exposed_unpaired_rings)
+        self.burried_unpaired_charged_reses = atoms_idx_to_res_fn(self.burried_unpaired_charged)
+        self.solvent_exposed_unpaired_charged_reses = atoms_idx_to_res_fn(self.solvent_exposed_unpaired_charged)
+        self.burried_hydrophobic_unpaired_near_prot_polar_reses = atoms_idx_to_res_fn(self.burried_hydrophobic_unpaired_near_prot_polar_atoms)
+    

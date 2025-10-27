@@ -5,7 +5,7 @@ from collections import namedtuple
 import numpy as np
 from openbabel.openbabel import OBAtomAtomIter
 
-from plip.basic import config, logger
+from plip.basic import logger, config
 from plip.basic.supplemental import vecangle, vector, euclidean3d, projection
 from plip.basic.supplemental import whichresnumber, whichrestype, whichchain
 
@@ -98,10 +98,10 @@ def hbonds(acceptors, donor_pairs, protisdon, typ):
         if config.INTRA is not None and whichresnumber(don.d) == whichresnumber(acc.a):
             continue
         # Next line prevents backbone-backbone H-Bonds
-        if config.INTRA is not None and protatom.GetResidue().GetAtomProperty(protatom,
+        '''if config.INTRA is not None and protatom.GetResidue().GetAtomProperty(protatom,
                                                                               8) and ligatom.GetResidue().GetAtomProperty(
                 ligatom, 8):
-            continue
+            continue'''
         contact = data(a=acc.a, a_orig_idx=acc.a_orig_idx, d=don.d, d_orig_idx=don.d_orig_idx, h=don.h,
                        distance_ah=dist_ah, distance_ad=dist_ad, angle=v, type=typ, protisdon=protisdon,
                        resnr=resnr, restype=restype, reschain=reschain, resnr_l=resnr_l,

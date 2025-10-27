@@ -425,6 +425,7 @@ def readmol(path, as_string=False):
         logger.debug('molecule successfully read')
 
         # Assign multiple bonds
+        # TO DO: Percieve bond orders only if there is no Connect records for an atom
         mymol.OBMol.PerceiveBondOrders()
         return mymol, sformat
 

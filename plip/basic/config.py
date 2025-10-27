@@ -33,6 +33,9 @@ NOPDBCANMAP = False  # Skip calculation of mapping canonical atom order: PDB ato
 NOHYDRO = False  # Do not add hydrogen bonds (in case already present in the structure)
 MODEL = 1  # The model to be selected for multi-model structures (default = 1).
 CHAINS = None # Define chains for protein-protein interaction detection
+PENALTIES = False
+BURRIED_FRAC = 0.4
+DETECT_CHARGED_GROUPS_PEPTIDE = True
 
 
 # Configuration file for Protein-Ligand Interaction Profiler (PLIP)
